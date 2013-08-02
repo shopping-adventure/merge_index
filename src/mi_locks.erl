@@ -38,49 +38,40 @@
     funs=[]
 }).
 
-new() -> [].
+new() -> dict:new().
 
 claim_many(Keys, Locks) ->
     lists:foldl(fun claim/2, Locks, Keys).
 
 claim(Key, Locks) ->
-    case lists:keyfind(Key, #lock.key, Locks) of
-        Lock = #lock { count=Count } ->
-            NewLock = Lock#lock { count=Count + 1 },
-            lists:keystore(Key, #lock.key, Locks, NewLock);
-
-        false ->
-            NewLock = #lock { key=Key, count=1, funs=[] },
-            lists:keystore(Key, #lock.key, Locks, NewLock)
+    case dict:find(Key,Locks) of
+        {ok,#lock{count=Count}=Lock}  ->
+            dict:store(Key,Lock#lock{count=Count + 1},Locks);
+        error ->
+            dict:store(Key,#lock{key=Key,count=1,funs=[]},Locks)
     end.
 
 release(Key, Locks) ->
-    case lists:keyfind(Key, #lock.key, Locks) of
-        #lock { count=1, funs=Funs } ->
+    case dict:find(Key,Locks) of
+        {ok,#lock{count=1,funs=Funs}} ->
             [X() || X <- Funs],
-            lists:keydelete(Key, #lock.key, Locks);
-
-        Lock = #lock { count=Count } ->
-            NewLock = Lock#lock { count = Count - 1 },
-            lists:keystore(Key, #lock.key, Locks, NewLock);
-
-        false ->
+            dict:erase(Key,Locks);
+        {ok,#lock{count=Count}=Lock} ->
+            dict:store(Key,Lock#lock{count=Count - 1},Locks);
+        error ->
             throw({lock_does_not_exist, Key})
     end.
 
 %% Run the provided function when the key is free. If the key is
 %% currently free, then this is run immeditaely.
 when_free(Key, Fun, Locks) ->
-    case lists:keyfind(Key, #lock.key, Locks) of
-        false ->
+    case dict:find(Key,Locks) of
+        error ->
             Fun(),
             Locks;
-
-        #lock { count=0, funs=Funs } ->
+        {ok,#lock{count=0,funs=Funs}} ->
             [X() || X <- [Fun|Funs]],
-            lists:keydelete(Key, #lock.key, Locks);
-
-        Lock = #lock { funs=Funs} ->
-            NewLock = Lock#lock { funs=[Fun|Funs] },
-            lists:keystore(Key, #lock.key, Locks, NewLock)
+            dict:erase(Key,Locks);
+        {ok,#lock{funs=Funs}=Lock} ->
+            dict:store(Key,Lock#lock{funs=[Fun|Funs]},Locks)
     end.
