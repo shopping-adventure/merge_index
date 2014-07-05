@@ -126,6 +126,15 @@ code_change(_OldVsn, State, _Extra) ->
 %% ====================================================================
 %% Internal worker
 %% ====================================================================
+-define(TIMERING_SIZE, 30).
+-define(TIMERING_SPAN_INIT, 130).
+
+-record(wstate, { parent,
+                 wanted_throughput,
+                 timering,
+                 timering_span,
+                 test_start,
+                 test_compactions}).
 
 %% THROTTLING: Run M processes in N seconds waiting ms_before_replace(Ring,N) before doing something
 %% and replace_oldest (impl is a set of size M of timestamps representing running processes.
@@ -136,20 +145,11 @@ replace_oldest({Set,Idx})->
 ms_before_replace({Set,Idx},N)->
     max(0,timer:seconds(N) - trunc(timer:now_diff(now(),element(Idx,Set))/1000)).
 
--define(TIMERING_SIZE, 10).
--define(TIMERING_SPAN_INIT, 10).
--record(wstate, { parent,
-                 wanted_throughput,
-                 timering,
-                 timering_span,
-                 test_start,
-                 test_compactions}).
-
 worker_init_state(Parent,WantedThroughput)->
     #wstate{parent=Parent, timering=new_timering(?TIMERING_SIZE),wanted_throughput=WantedThroughput,
         timering_span=?TIMERING_SPAN_INIT,test_start=now(),test_compactions=[]}.
 
-worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
+worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,wanted_throughput=WantedThroughput,
                    test_compactions=TestCompactions}=State) when length(TestCompactions)==?TIMERING_SIZE ->
     TestBytes = lists:sum([OldBytes || {ok, _, OldBytes}<-TestCompactions]),
     TestSegments = lists:sum([OldSegments || {ok, OldSegments, _}<-TestCompactions]),
@@ -157,7 +157,15 @@ worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
     Throughput = TestBytes/TestElapsedSecs/(1024*1024),
     lager:info("Overall Compaction: ~p segments for ~p bytes in ~p seconds, ~.2f MB/sec",
                [TestSegments, TestBytes, TestElapsedSecs, Throughput]),
-    worker_loop(State#wstate{timering_span=TimeRingSpan,test_start=now(),test_compactions=[]});
+    AcceptableDiff = WantedThroughput*0.2,
+    case abs(Throughput-WantedThroughput) of
+        Diff when Diff < AcceptableDiff -> 
+            worker_loop(State#wstate{timering_span=TimeRingSpan,test_start=now(),test_compactions=[]});
+        _ -> %% We need to adjust timering span window in order to have the good throughput
+            NewTimeRingSpan = trunc(TimeRingSpan * (WantedThroughput/Throughput)),
+            lager:info("Adjust throttling to have ~p compaction every ~p seconds",[?TIMERING_SIZE,NewTimeRingSpan]),
+            worker_loop(State#wstate{timering_span=NewTimeRingSpan,test_start=now(),test_compactions=[]})
+    end;
 
 worker_loop(#wstate{parent=Parent,timering=TimeRing,
                     timering_span=TimeRingSpan, test_compactions=TestCompactions}=State) ->
