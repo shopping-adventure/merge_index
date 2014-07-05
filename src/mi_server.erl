@@ -745,6 +745,34 @@ group_iterator(Iterator, eof) ->
 clear_deleteme_flag(Filename) ->
     file:delete(Filename ++ ?DELETEME_FLAG).
 
+%% Figure out which files to merge. Take the average of file sizes,
+%% return anything smaller than the average for merging.
+get_segments_to_merge(Segments) ->
+    %% sort segs to group them in average size groups in a deterministic way
+    Buckets = get_buckets(lists:sort([{mi_segment:filesize(X),X} || X <- Segments])),
+    PrunedBuckets = dict:fold(
+        fun (_,Bucket,Acc0) when length(Bucket) > 4 -> Acc0;
+            (_,Bucket,Acc0)-> 
+                ToMerge = lists:sublist(Bucket, min(length(Bucket),80)),
+                Avg = lists:sum([Size || {Size,_}<-Bucket]) div length(Bucket),
+                [{Avg,ToMerge}|Acc0]
+        end, [],Buckets)
+    [{_,Segs}|_] = lists:sort(PrunedBuckets),
+    Segs
+
+get_buckets(SortedSizedSegments)->
+    lists:foldl(fun({Size,_}=Seg,Acc0)->
+        NotSimilar = fun({AverageSize,Bucket})->
+            (Size < AverageSize*0.5 or Size > AverageSize*1.5) and (Size > 50000000 or AverageSize > 50000000)
+        end,
+        case lists:dropwhile(NotSimilar,dict:to_list(Acc0)) of % if a bucket is similar, add seg to bucket and change averagesize
+            [{AverageSize,Bucket}|_] -> NbSeg = length(Bucket),
+                dict:store((AverageSize*NbSeg+Size)/(NbSeg+1),[Seg|Bucket],dict:erase(AverageSize,Acc0));
+            [] -> % else create a single bucket with the seg
+                dict:store(Size,[Seg],Acc0) 
+        end 
+    end,dict:new(),SortedSizedSegments).
+
 fold_itr(_Fun, Acc, eof) -> Acc;
 fold_itr(Fun, Acc, {Term, IteratorFun}) ->
     fold_itr(Fun, Fun(Term, Acc), IteratorFun()).
