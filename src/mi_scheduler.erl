@@ -26,7 +26,10 @@
 -export([
     start_link/0,
     start/0,
-    schedule_compaction/1
+    schedule_compaction/1,
+    ms_before_replace/2,
+    new_timering/1,
+    replace_oldest/1
 ]).
 %% Private export
 -export([worker_loop/1]).
@@ -63,14 +66,14 @@ init([]) ->
     %% Trap exits of the actual worker process
     process_flag(trap_exit, true),
 
-    WantedThroughput = application:get_env(merge_index, compaction_throughput_mb_per_sec, 30),
+    {ok,WantedThroughput} = application:get_env(merge_index, compaction_throughput_mb_per_sec),
 
     %% Use a dedicated worker sub-process to do the actual merging. The
     %% process may ignore messages for a long while during the compaction
     %% and we want to ensure that our message queue doesn't fill up with
     %% a bunch of dup requests for the same directory.
-
-    WorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(self(),WantedThroughput)) end),
+    Self = self(),
+    WorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(Self,WantedThroughput)) end),
     {ok, #state{ queue = queue:new(),
                  worker = WorkerPid,
                  ready = true}}.
@@ -108,8 +111,9 @@ handle_info({worker_ready, WorkerPid}, #state { queue = Q } = State) ->
 handle_info({'EXIT', WorkerPid, Reason}, #state { worker = WorkerPid } = State) ->
     lager:error("Compaction worker ~p exited: ~p", [WorkerPid, Reason]),
     %% Start a new worker.
-    WantedThroughput = application:get_env(merge_index, compaction_throughput_mb_per_sec, 30),
-    NewWorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(self(),WantedThroughput)) end),
+    {ok,WantedThroughput} = application:get_env(merge_index, compaction_throughput_mb_per_sec),
+    Self = self(),
+    NewWorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(Self,WantedThroughput)) end),
     NewState = State#state { worker=NewWorkerPid , ready = true},
     {noreply, NewState};
 
@@ -126,8 +130,8 @@ code_change(_OldVsn, State, _Extra) ->
 %% ====================================================================
 %% Internal worker
 %% ====================================================================
--define(TIMERING_SIZE, 30).
--define(TIMERING_SPAN_INIT, 130).
+-define(TIMERING_SIZE, 40).
+-define(TIMERING_SPAN_INIT, 3).
 
 -record(wstate, { parent,
                  wanted_throughput,
@@ -141,9 +145,9 @@ code_change(_OldVsn, State, _Extra) ->
 %% Replace the oldest one if older than N seconds else wait (oldest_ts-Nsec) : {Ts_Set, Oldest_Idx}
 new_timering(M)->{erlang:make_tuple(M,now()),1}.
 replace_oldest({Set,Idx})->
-    {erlang:insert_element(Idx,Set,now()),case Idx+1 of X when X>tuple_size(Set) ->1; X->X end}.
+   {erlang:setelement(Idx,Set,now()),case Idx+1 of X when X>erlang:size(Set) ->1; X->X end}.
 ms_before_replace({Set,Idx},N)->
-    max(0,timer:seconds(N) - trunc(timer:now_diff(now(),element(Idx,Set))/1000)).
+   max(0,timer:seconds(N) - trunc(timer:now_diff(now(),element(Idx,Set))/1000)).
 
 worker_init_state(Parent,WantedThroughput)->
     #wstate{parent=Parent, timering=new_timering(?TIMERING_SIZE),wanted_throughput=WantedThroughput,
@@ -162,7 +166,7 @@ worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,wanted_throu
         Diff when Diff < AcceptableDiff -> 
             worker_loop(State#wstate{timering_span=TimeRingSpan,test_start=now(),test_compactions=[]});
         _ -> %% We need to adjust timering span window in order to have the good throughput
-            NewTimeRingSpan = trunc(TimeRingSpan * (WantedThroughput/Throughput)),
+            NewTimeRingSpan = trunc(TimeRingSpan * (Throughput/WantedThroughput)) + 1,
             lager:info("Adjust throttling to have ~p compaction every ~p seconds",[?TIMERING_SIZE,NewTimeRingSpan]),
             worker_loop(State#wstate{timering_span=NewTimeRingSpan,test_start=now(),test_compactions=[]})
     end;

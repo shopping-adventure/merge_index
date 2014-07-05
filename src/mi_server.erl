@@ -156,10 +156,12 @@ init([Root]) ->
     process_flag(trap_exit, true),
 
     %% Cache config in order to avoid application:get_env overhead
-    SegSimilarityRatio = application:get_env(merge_index, segment_similarity_ratio, 0.5),
+    {ok,SegSimilarityRatio} = application:get_env(merge_index, segment_similarity_ratio),
+    {ok,MaxCompactSegments} = application:get_env(merge_index, max_compact_segments),
+    {ok,MinSegmentSize} = application:get_env(merge_index, min_segment_size),
     Config = #config{
-        max_compact_segments=application:get_env(merge_index, max_compact_segments, 20),
-        min_segment_size=application:get_env(merge_index, min_segment_size, 50000000),
+        max_compact_segments=MaxCompactSegments,
+        min_segment_size=MinSegmentSize,
         bucket_low=1-SegSimilarityRatio,
         bucket_high=1+SegSimilarityRatio
     },
@@ -430,7 +432,9 @@ handle_cast({compacted, CompactSegmentWO, OldSegments, OldBytes, From}, State) -
 
     [set_deleteme_flag(mi_segment:filename(X)) || X <- OldSegments],
     F = fun(X, Acc) ->
-        mi_locks:when_free(mi_segment:filename(X), fun() -> mi_segment:delete(X) end, Acc)
+        Key = mi_segment:filename(X),
+        Acc1 = mi_locks:when_free(Key, fun() -> mi_segment:delete(X) end, Acc),
+        mi_locks:release_compact(Key,Acc1)
     end,
     NewLocks = lists:foldl(F, Locks, OldSegments),
 

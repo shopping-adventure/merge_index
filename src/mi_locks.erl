@@ -37,7 +37,7 @@
 
 -record(lock, {
     count,
-    not_compacting,
+    not_compacting=true,
     funs=[]
 }).
 
@@ -81,17 +81,16 @@ when_free(Key, Fun, Locks) ->
 
 claim_compact(Key,Locks) ->
     case dict:find(Key,Locks) of
-        {ok,#lock{not_compacting=false}}  -> Locks;
-        {ok,Lock} -> dict:store(Key,Lock#lock{not_compacting=false},Locks);
-        error -> dict:store(Key,#lock{count=0,funs=[],not_compacting=false},Locks)
+        {ok,#lock{count=Count}=Lock} -> dict:store(Key,Lock#lock{not_compacting=false,count=Count+1},Locks);
+        error -> dict:store(Key,#lock{count=1,funs=[],not_compacting=false},Locks)
     end.
 
 release_compact(Key,Locks) ->
-    case dict:find(Key,Locks) of
-        {ok,#lock{not_compacting=true}}  -> Locks;
+    NewLocks = case dict:find(Key,Locks) of
         {ok,Lock} -> dict:store(Key,Lock#lock{not_compacting=true},Locks);
-        error -> dict:store(Key,#lock{count=0,funs=[],not_compacting=true},Locks)
-    end.
+        error -> throw({lock_does_not_exist, Key})
+    end,
+    release(Key,NewLocks).
 
 is_compact_free(Key,Locks) ->
     case dict:find(Key,Locks) of
