@@ -29,7 +29,10 @@
          claim/2,
          claim_many/2,
          release/2,
-         when_free/3
+         when_free/3,
+         claim_compact/2,
+         release_compact/2,
+         is_compact_free/2
         ]).
 
 -record(lock, {
