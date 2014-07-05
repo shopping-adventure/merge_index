@@ -59,7 +59,7 @@
     segments,
     buffers,
     next_id,
-    is_compacting,
+    config,
     lookup_range_pids,
     buffer_rollover_size,
     converter,
@@ -73,6 +73,14 @@
           buffers,
           segments
          }).
+
+-record(config, {
+          max_compact_segments,
+          bucket_low,
+          bucket_high,
+          min_segment_size
+         }).
+-define(MIN_COMPACT_SEGMENTS,5).
 
 -define(RESULTVEC_SIZE, 1000).
 -define(DELETEME_FLAG, ".deleted").
@@ -146,6 +154,15 @@ init([Root]) ->
     %% don't pull down this merge_index if they fail
     process_flag(trap_exit, true),
 
+    %% Cache config in order to avoid application:get_env overhead
+    SegSimilarityRatio = application:get_env(merge_index, segment_similarity_ratio, 0.5),
+    Config = #config{
+        max_compact_segments=application:get_env(merge_index, max_compact_segments, 20),
+        min_segment_size=application:get_env(merge_index, min_segment_size, 50000000),
+        bucket_low=1-SegSimilarityRatio,
+        bucket_high=1+SegSimilarityRatio
+    },
+
     %% Create the state...
     State = #state {
         root     = Root,
@@ -153,7 +170,8 @@ init([Root]) ->
         buffers  = [Buffer],
         segments = Segments,
         next_id  = NextID,
-        is_compacting = false,
+        config   = Config,
+        compacting_pids = [],
         lookup_range_pids = [],
         buffer_rollover_size=fuzzed_rollover_size(),
         to_convert = queue:new()
@@ -224,52 +242,40 @@ handle_call({index, Postings}, _From, State) ->
     end;
 
 handle_call(start_compaction, _From, State)
-  when is_tuple(State#state.is_compacting) ->
-    %% Don't compact if we are already compacting, or if we have fewer
-    %% than five open segments.
+  when length(State#state.segments) =< ?MIN_COMPACT_SEGMENTS ->
+    %% Don't compact if we have fewer than MIN_COMPACT_SEGMENTS
     {reply, {ok, 0, 0}, State};
 
 handle_call(start_compaction, From, State) ->
-    %% Get list of segments to compact. Do this by getting filesizes,
-    %% and then lopping off files larger than the average. This could be
-    %% optimized with tuning, but probably a good enough solution.
-    Segments = State#state.segments,
-    {ok, MaxSegments} = application:get_env(merge_index, max_compact_segments),
-    {ok, {M,F}} = application:get_env(merge_index, compact_mod_fun),
-    SegmentsToCompact = case M:F(Segments) of
-                            STC when length(STC) > MaxSegments ->
-                                lists:sublist(STC, MaxSegments);
-                            STC ->
-                                STC
-                        end,
-
-    case SegmentsToCompact of
-        [] ->
-            {reply, {ok, 0, 0}, State};
-        _ ->
+    %% Get list of segments to compact : as Cassandra SizeTieredCompactionStrategy
+    #state{segments=Segments,locks=Locks,config=Config,compacting_pids=CompactingPids} = State,
+    case get_segments_to_merge(Segments,Config,Locks) of
+        [] -> {reply, {ok, 0, 0}, State};
+        SegmentsToCompact -> 
             BytesToCompact = lists:sum([mi_segment:filesize(X) || X <- SegmentsToCompact]),
 
             %% Spawn a function to merge a bunch of segments into one...
             Pid = self(),
-            CF =
-                fun() ->
-                        %% Create the group iterator...
-                        SegmentIterators = [mi_segment:iterator(X) || X <- SegmentsToCompact],
-                        GroupIterator = build_iterator_tree(SegmentIterators),
+            CompactingPid = spawn_opt(fun() ->
+                %% Create the group iterator...
+                SegmentIterators = [mi_segment:iterator(X) || X <- SegmentsToCompact],
+                GroupIterator = build_iterator_tree(SegmentIterators),
 
-                        %% Create the new compaction segment...
-                        <<MD5:128/integer>> = erlang:md5(term_to_binary({now, make_ref()})),
-                        SName = join(State, io_lib:format("segment.~.16B", [MD5])),
-                        set_deleteme_flag(SName),
-                        CompactSegment = mi_segment:open_write(SName),
+                %% Create the new compaction segment...
+                <<MD5:128/integer>> = erlang:md5(term_to_binary({now, make_ref()})),
+                SName = join(State, io_lib:format("segment.~.16B", [MD5])),
+                set_deleteme_flag(SName),
+                CompactSegment = mi_segment:open_write(SName),
 
-                        %% Run the compaction...
-                        mi_segment:from_iterator(GroupIterator, CompactSegment),
-                        gen_server:cast(Pid, {compacted, CompactSegment, SegmentsToCompact, BytesToCompact, From})
-                end,
-            CompactingPid = spawn_opt(CF, [link, {fullsweep_after, 0}]),
-            {noreply, State#state { is_compacting={From, CompactingPid} }}
-    end;
+                %% Run the compaction...
+                mi_segment:from_iterator(GroupIterator, CompactSegment),
+                gen_server:cast(Pid, {compacted, CompactSegment, SegmentsToCompact, BytesToCompact, From})
+            end, [link, {fullsweep_after, 0}]),
+            NewLocks = lists:foldl(fun (S,Acc)->
+                    mi_locks:claim_compact(mi_segment:filename(S),Acc)
+                end,Locks,SegmentsToCompact),
+            {noreply, State#state { compacting_pids=[{From, CompactingPid}|CompactingPids] , locks=NewLocks}}
+        end;
 
 handle_call({info, Index, Field, Term}, _From, State) ->
     %% Calculate the IFT...
@@ -411,7 +417,7 @@ handle_call(Msg, _From, State) ->
     {reply, ok, State}.
 
 handle_cast({compacted, CompactSegmentWO, OldSegments, OldBytes, From}, State) ->
-    #state { locks=Locks, segments=Segments } = State,
+    #state { locks=Locks, segments=Segments , compacting_pids=CompactingPids } = State,
 
     %% Clean up. Remove delete flag on the new segment. Add delete
     %% flags to the old segments. Register to delete the old segments
@@ -431,7 +437,7 @@ handle_cast({compacted, CompactSegmentWO, OldSegments, OldBytes, From}, State) -
     NewState = State#state {
         locks=NewLocks,
         segments=[CompactSegmentRO|(Segments -- OldSegments)],
-        is_compacting=false
+        compacting_pids=lists:keydelete(From,1,CompactingPids)
     },
 
     %% Tell the awaiting process that we've finished compaction.
@@ -440,8 +446,7 @@ handle_cast({compacted, CompactSegmentWO, OldSegments, OldBytes, From}, State) -
 
 handle_cast({buffer_to_segment, Buffer, SegmentWO}, State) ->
     #state { root=Root, locks=Locks, buffers=Buffers, segments=Segments,
-             to_convert=ToConvert,
-             is_compacting=IsCompacting } = State,
+             to_convert=ToConvert } = State,
 
     %% Clean up by clearing delete flag on the segment, adding delete
     %% flag to the buffer, and telling the system to delete the buffer
@@ -481,14 +486,7 @@ handle_cast({buffer_to_segment, Buffer, SegmentWO}, State) ->
                         },
 
             %% Give us the opportunity to do a merge...
-            {ok, {M,F}} = application:get_env(merge_index, compact_mod_fun),
-            SegmentsToMerge = M:F(NewSegments),
-            case length(SegmentsToMerge) of
-                Num when Num =< 2 orelse is_tuple(IsCompacting) ->
-                    ok;
-                _ ->
-                    mi_scheduler:schedule_compaction(self())
-            end,
+            mi_scheduler:schedule_compaction(self()),
             {noreply, NewState};
         false ->
             lager:warning("`buffer_to_segment` cast received"
@@ -501,27 +499,8 @@ handle_cast(Msg, State) ->
     lager:error("Unexpected cast ~p", [Msg]),
     {noreply, State}.
 
-handle_info({'EXIT', CompactingPid, Reason},
-            #state{is_compacting={From, CompactingPid}}=State) ->
-    %% the spawned compaction process exited
-    case Reason of
-        normal ->
-            %% compaction finished normally: nothing to be done
-            %% handle_call({compacted... already sent the reply
-            ok;
-        _ ->
-            %% compaction failed: not too much to worry about
-            %% (it should be safe to try again later)
-            %% but we need to let the compaction-requester know
-            %% that we're not compacting any more
-            gen_server:reply(From, {error, Reason})
-    end,
-
-    %% clear out compaction flags, so we try again when necessary
-    {noreply, State#state{is_compacting=false}};
-
 handle_info({'EXIT', Pid, Reason},
-            #state{lookup_range_pids=SRPids}=State) ->
+            #state{lookup_range_pids=SRPids,compacting=Compacting}=State) ->
 
     case lists:keytake(Pid, #stream_range.pid, SRPids) of
         {value, SR, NewSRPids} ->
@@ -553,8 +532,21 @@ handle_info({'EXIT', Pid, Reason},
             {noreply, State#state { locks=NewLocks1,
                                     lookup_range_pids=NewSRPids }};
         false ->
-            %% some random other process exited: ignore
-            {noreply, State}
+            case lists:keytake(Pid, 2, CompactingPids) of
+                {value, {From,_CompactingPid}, NewCompactingPids}->
+                    %% a spawned compaction process exited
+                    case Reason of
+                        normal -> ok; %% compaction finished normally: nothing to be done
+                        _ -> %% compaction failed: not too much to worry about (it should be safe to try again later)
+                             %% but we need to let the compaction-requester know
+                             %% that we're not compacting any more
+                            gen_server:reply(From, {error, Reason})
+                    end,
+                    %% clear out compaction flags, so we try again when necessary
+                    {noreply, State#state{compacting_pids=NewCompactingPids}};
+                false -> %% some random other process exited: ignore
+                    {noreply, State}
+            end
     end;
 
 handle_info(Msg, State) ->
@@ -745,25 +737,34 @@ group_iterator(Iterator, eof) ->
 clear_deleteme_flag(Filename) ->
     file:delete(Filename ++ ?DELETEME_FLAG).
 
-%% Figure out which files to merge. Take the average of file sizes,
-%% return anything smaller than the average for merging.
-get_segments_to_merge(Segments) ->
-    %% sort segs to group them in average size groups in a deterministic way
-    Buckets = get_buckets(lists:sort([{mi_segment:filesize(X),X} || X <- Segments])),
+%% Figure out which files to merge
+get_segments_to_merge(Segments,#{max_compact_segments=MaxCompactSegments}=Config,Locks) ->
+    NotCompactingSegments = lists:filter(fun(S)->
+            mi_locks:is_compact_free(mi_segment:filename(S),Locks)
+        end,Segments),
+    %% Group segments by similar size (buckets)
+    Buckets = get_buckets(Segments,Config),
+    %% Take only the groups > min_compact_segments and take the max_compact_segments firsts
     PrunedBuckets = dict:fold(
-        fun (_,Bucket,Acc0) when length(Bucket) > 4 -> Acc0;
+        fun (_,Bucket,Acc0) when length(Bucket) < ?MIN_COMPACT_SEGMENTS -> Acc0;
             (_,Bucket,Acc0)-> 
-                ToMerge = lists:sublist(Bucket, min(length(Bucket),80)),
+                SortedBucket = lists:reverse(Bucket), %% alreay sorted by construction but reversed 
+                ToMerge = lists:sublist(SortedBucket, min(length(Bucket),MaxCompactSegments)),
                 Avg = lists:sum([Size || {Size,_}<-Bucket]) div length(Bucket),
                 [{Avg,ToMerge}|Acc0]
-        end, [],Buckets)
-    [{_,Segs}|_] = lists:sort(PrunedBuckets),
-    Segs
+        end, [],Buckets),
+    %% then take the group with the smallest segment average size
+    case lists:sort(PrunedBuckets) of
+        [] -> [];
+        [{_,Segs}|_] = [Seg || {_,Seg}<-Segs]
+    end.
 
-get_buckets(SortedSizedSegments)->
+get_buckets(Segments,#config{bucket_low=BucketLow, bucket_high=BucketHigh, min_segment_size=MinSegSize})->
+    %% sort segs to group them in average size groups in a deterministic way
+    SortedSizedSegments = lists:sort([{mi_segment:filesize(X),X} || X <- Segments]),
     lists:foldl(fun({Size,_}=Seg,Acc0)->
         NotSimilar = fun({AverageSize,Bucket})->
-            (Size < AverageSize*0.5 or Size > AverageSize*1.5) and (Size > 50000000 or AverageSize > 50000000)
+            not ((Size > AverageSize*BucketLow and Size < AverageSize*BucketHigh) or (Size < MinSegSize and AverageSize < MinSegSize))
         end,
         case lists:dropwhile(NotSimilar,dict:to_list(Acc0)) of % if a bucket is similar, add seg to bucket and change averagesize
             [{AverageSize,Bucket}|_] -> NbSeg = length(Bucket),

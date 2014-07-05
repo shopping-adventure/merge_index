@@ -38,6 +38,7 @@
          terminate/2, code_change/3]).
 
 -record(state, { queue,
+                 ready,
                  worker }).
 
 %% ====================================================================
@@ -62,16 +63,23 @@ init([]) ->
     %% Trap exits of the actual worker process
     process_flag(trap_exit, true),
 
+    WantedThroughput = application:get_env(merge_index, compaction_throughput_mb_per_sec, 30),
+
     %% Use a dedicated worker sub-process to do the actual merging. The
     %% process may ignore messages for a long while during the compaction
     %% and we want to ensure that our message queue doesn't fill up with
     %% a bunch of dup requests for the same directory.
-    Self = self(),
-    WorkerPid = spawn_link(fun() -> worker_loop(Self) end),
-    {ok, #state{ queue = queue:new(),
-                 worker = WorkerPid }}.
 
-handle_call({schedule_compaction, Pid}, _From, #state { queue = Q } = State) ->
+    WorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(self(),WantedThroughput)) end),
+    {ok, #state{ queue = queue:new(),
+                 worker = WorkerPid,
+                 ready = true}}.
+
+handle_call({schedule_compaction, Pid}, _From, #state { ready = true, worker = WorkerPid } = State) ->
+     WorkerPid ! {compaction, Pid},
+     {reply, ok, State#state {ready = false}};
+        
+handle_call({schedule_compaction, Pid}, _From, #state { ready = false, queue = Q } = State) ->
     case queue:member(Pid, Q) of
         true ->
             {reply, already_queued, State};
@@ -91,18 +99,18 @@ handle_cast(Msg, State) ->
 handle_info({worker_ready, WorkerPid}, #state { queue = Q } = State) ->
     case queue:out(Q) of
         {empty, Q} ->
-            {noreply, State};
+            {noreply, State#state{ ready = true }};
         {{value, Pid}, NewQ} ->
             WorkerPid ! {compaction, Pid},
-            NewState = State#state { queue=NewQ },
+            NewState = State#state { queue=NewQ , ready = false },
             {noreply, NewState}
     end;
 handle_info({'EXIT', WorkerPid, Reason}, #state { worker = WorkerPid } = State) ->
     lager:error("Compaction worker ~p exited: ~p", [WorkerPid, Reason]),
     %% Start a new worker.
-    Self=self(),
-    NewWorkerPid = spawn_link(fun() -> worker_loop(Self) end),
-    NewState = State#state { worker=NewWorkerPid },
+    WantedThroughput = application:get_env(merge_index, compaction_throughput_mb_per_sec, 30),
+    NewWorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(self(),WantedThroughput)) end),
+    NewState = State#state { worker=NewWorkerPid , ready = true},
     {noreply, NewState};
 
 handle_info(Info, State) ->
@@ -119,31 +127,68 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal worker
 %% ====================================================================
 
-worker_loop(Parent) ->
-    Parent ! {worker_ready, self()},
-    receive
-        {compaction, Pid} ->
-            Start = os:timestamp(),
-            Result = merge_index:compact(Pid),
-            ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
-            case Result of
-                {ok, OldSegments, OldBytes} ->
-                    case ElapsedSecs > 1 of
-                        true ->
-                            lager:info(
-                              "Pid ~p compacted ~p segments for ~p bytes in ~p seconds, ~.2f MB/sec",
-                              [Pid, OldSegments, OldBytes, ElapsedSecs, OldBytes/ElapsedSecs/(1024*1024)]);
-                        false ->
-                            ok
-                    end;
+%% THROTTLING: Run M processes in N seconds waiting ms_before_replace(Ring,N) before doing something
+%% and replace_oldest (impl is a set of size M of timestamps representing running processes.
+%% Replace the oldest one if older than N seconds else wait (oldest_ts-Nsec) : {Ts_Set, Oldest_Idx}
+new_timering(M)->{make_tuple(M,now()),1}.
+replace_oldest({Set,Idx})->
+    {insert_element(Idx,Set,now()),case Idx+1 of X when X>tuple_size(Set) ->1; X->X end}.
+ms_before_replace({Set,Idx},N)->
+    max(0,timer:seconds(N) - trunc(timer:now_diff(now(),element(Idx,Set))/1000)).
 
-                {Error, Reason} when Error == error; Error == 'EXIT' ->
-                    lager:error("Failed to compact ~p: ~p", [Pid, Reason])
-            end,
-            ?MODULE:worker_loop(Parent);
+-define(TIMERING_SIZE, 10).
+-define(TIMERING_SPAN_INIT, 10).
+-record(wstate, { parent,
+                 wanted_throughput,
+                 timering,
+                 timering_span,
+                 test_start,
+                 test_compactions}).
+
+worker_init_state(Parent,WantedThroughput)->
+    #wstate{parent=Parent, timering=new_timering(?TIMERING_SIZE),wanted_throughput=WantedThroughput,
+        timering_span=?TIMERING_SPAN_INIT,test_start=now(),test_compactions=[]}
+
+worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
+                   test_compactions=TestCompactions}=State) when length(TestCompactions)==?TIMERING_SIZE ->
+    TestBytes = lists:sum([OldBytes || {ok, _, OldBytes}<-TestCompactions]),
+    TestSegments = lists:sum([OldSegments || {ok, OldSegments, _}<-TestCompactions]),
+    TestElapsedSecs = timer:now_diff(os:timestamp(), TestStart) / 1000000,
+    Throughput = TestBytes/TestElapsedSecs/(1024*1024),
+    lager:info("Overall Compaction: ~p segments for ~p bytes in ~p seconds, ~.2f MB/sec",
+               [TestSegments, TestBytes, TestElapsedSecs, Throughput]),
+    worker_loop(State#wstate{timering_span=TimeRingSpan,test_start=now(),test_compactions=[]});
+
+worker_loop(#wstate{parent=Parent,timering=TimeRing,timering_span=TimeRingSpan,
+                   test_start=TestStart,test_compactions=TestCompactions}=State) ->
+    Worker = self(),
+    receive
+        {compaction_res,Result}->
+            ?MODULE:worker_loop(State#wstate{test_compactions=[Result|TestCompactions]});
+        {compaction, Pid} ->
+            spawn_link(fun()->
+                Start = os:timestamp(),
+                Result = merge_index:compact(Pid),
+                Worker ! {compaction_res,Result}
+                ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
+                case Result of
+                    {ok, OldSegments, OldBytes} ->
+                        case ElapsedSecs > 1 of
+                            true ->
+                                lager:info(
+                                  "Single Compaction ~p: ~p segments for ~p bytes in ~p seconds, ~.2f MB/sec",
+                                  [Pid, OldSegments, OldBytes, ElapsedSecs, OldBytes/ElapsedSecs/(1024*1024)]);
+                            false ->
+                                ok
+                        end;
+
+                    {Error, Reason} when Error == error; Error == 'EXIT' ->
+                        lager:error("Failed to compact ~p: ~p", [Pid, Reason])
+                end,
+            end),
+            send_after(ms_before_replace(TimeRing,TimeRingSpan),Parent,{worker_ready,Worker}),
+            ?MODULE:worker_loop(State#wstate{timering=replace_oldest(TimeRing)});
         _ ->
             %% ignore unknown messages
-            ?MODULE:worker_loop(Parent)
-    after 1000 ->
-            ?MODULE:worker_loop(Parent)
+            ?MODULE:worker_loop(State)
     end.
