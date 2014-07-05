@@ -130,9 +130,9 @@ code_change(_OldVsn, State, _Extra) ->
 %% THROTTLING: Run M processes in N seconds waiting ms_before_replace(Ring,N) before doing something
 %% and replace_oldest (impl is a set of size M of timestamps representing running processes.
 %% Replace the oldest one if older than N seconds else wait (oldest_ts-Nsec) : {Ts_Set, Oldest_Idx}
-new_timering(M)->{make_tuple(M,now()),1}.
+new_timering(M)->{erlang:make_tuple(M,now()),1}.
 replace_oldest({Set,Idx})->
-    {insert_element(Idx,Set,now()),case Idx+1 of X when X>tuple_size(Set) ->1; X->X end}.
+    {erlang:insert_element(Idx,Set,now()),case Idx+1 of X when X>tuple_size(Set) ->1; X->X end}.
 ms_before_replace({Set,Idx},N)->
     max(0,timer:seconds(N) - trunc(timer:now_diff(now(),element(Idx,Set))/1000)).
 
@@ -147,7 +147,7 @@ ms_before_replace({Set,Idx},N)->
 
 worker_init_state(Parent,WantedThroughput)->
     #wstate{parent=Parent, timering=new_timering(?TIMERING_SIZE),wanted_throughput=WantedThroughput,
-        timering_span=?TIMERING_SPAN_INIT,test_start=now(),test_compactions=[]}
+        timering_span=?TIMERING_SPAN_INIT,test_start=now(),test_compactions=[]}.
 
 worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
                    test_compactions=TestCompactions}=State) when length(TestCompactions)==?TIMERING_SIZE ->
@@ -159,8 +159,8 @@ worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
                [TestSegments, TestBytes, TestElapsedSecs, Throughput]),
     worker_loop(State#wstate{timering_span=TimeRingSpan,test_start=now(),test_compactions=[]});
 
-worker_loop(#wstate{parent=Parent,timering=TimeRing,timering_span=TimeRingSpan,
-                   test_start=TestStart,test_compactions=TestCompactions}=State) ->
+worker_loop(#wstate{parent=Parent,timering=TimeRing,
+                    timering_span=TimeRingSpan, test_compactions=TestCompactions}=State) ->
     Worker = self(),
     receive
         {compaction_res,Result}->
@@ -169,7 +169,7 @@ worker_loop(#wstate{parent=Parent,timering=TimeRing,timering_span=TimeRingSpan,
             spawn_link(fun()->
                 Start = os:timestamp(),
                 Result = merge_index:compact(Pid),
-                Worker ! {compaction_res,Result}
+                Worker ! {compaction_res,Result},
                 ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
                 case Result of
                     {ok, OldSegments, OldBytes} ->
@@ -184,9 +184,9 @@ worker_loop(#wstate{parent=Parent,timering=TimeRing,timering_span=TimeRingSpan,
 
                     {Error, Reason} when Error == error; Error == 'EXIT' ->
                         lager:error("Failed to compact ~p: ~p", [Pid, Reason])
-                end,
+                end
             end),
-            send_after(ms_before_replace(TimeRing,TimeRingSpan),Parent,{worker_ready,Worker}),
+            erlang:send_after(ms_before_replace(TimeRing,TimeRingSpan),Parent,{worker_ready,Worker}),
             ?MODULE:worker_loop(State#wstate{timering=replace_oldest(TimeRing)});
         _ ->
             %% ignore unknown messages

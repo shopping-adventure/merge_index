@@ -78,20 +78,20 @@ when_free(Key, Fun, Locks) ->
 
 claim_compact(Key,Locks) ->
     case dict:find(Key,Locks) of
-        {ok,#lock{not_compacting=false}}  -> Locks
+        {ok,#lock{not_compacting=false}}  -> Locks;
         {ok,Lock} -> dict:store(Key,Lock#lock{not_compacting=false},Locks);
         error -> dict:store(Key,#lock{count=0,funs=[],not_compacting=false},Locks)
     end.
 
 release_compact(Key,Locks) ->
     case dict:find(Key,Locks) of
-        {ok,#lock{not_compacting=true}}  -> Locks
+        {ok,#lock{not_compacting=true}}  -> Locks;
         {ok,Lock} -> dict:store(Key,Lock#lock{not_compacting=true},Locks);
         error -> dict:store(Key,#lock{count=0,funs=[],not_compacting=true},Locks)
     end.
 
 is_compact_free(Key,Locks) ->
     case dict:find(Key,Locks) of
-        {ok,Lock} -> Lock#lock.not_compacting
+        {ok,Lock} -> Lock#lock.not_compacting;
         error -> true
     end.

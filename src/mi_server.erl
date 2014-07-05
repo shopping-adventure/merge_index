@@ -60,6 +60,7 @@
     buffers,
     next_id,
     config,
+    compacting_pids,
     lookup_range_pids,
     buffer_rollover_size,
     converter,
@@ -500,7 +501,7 @@ handle_cast(Msg, State) ->
     {noreply, State}.
 
 handle_info({'EXIT', Pid, Reason},
-            #state{lookup_range_pids=SRPids,compacting=Compacting}=State) ->
+            #state{lookup_range_pids=SRPids,compacting_pids=CompactingPids}=State) ->
 
     case lists:keytake(Pid, #stream_range.pid, SRPids) of
         {value, SR, NewSRPids} ->
@@ -738,12 +739,12 @@ clear_deleteme_flag(Filename) ->
     file:delete(Filename ++ ?DELETEME_FLAG).
 
 %% Figure out which files to merge
-get_segments_to_merge(Segments,#{max_compact_segments=MaxCompactSegments}=Config,Locks) ->
+get_segments_to_merge(Segments,#config{max_compact_segments=MaxCompactSegments}=Config,Locks) ->
     NotCompactingSegments = lists:filter(fun(S)->
             mi_locks:is_compact_free(mi_segment:filename(S),Locks)
         end,Segments),
     %% Group segments by similar size (buckets)
-    Buckets = get_buckets(Segments,Config),
+    Buckets = get_buckets(NotCompactingSegments,Config),
     %% Take only the groups > min_compact_segments and take the max_compact_segments firsts
     PrunedBuckets = dict:fold(
         fun (_,Bucket,Acc0) when length(Bucket) < ?MIN_COMPACT_SEGMENTS -> Acc0;
@@ -756,15 +757,16 @@ get_segments_to_merge(Segments,#{max_compact_segments=MaxCompactSegments}=Config
     %% then take the group with the smallest segment average size
     case lists:sort(PrunedBuckets) of
         [] -> [];
-        [{_,Segs}|_] = [Seg || {_,Seg}<-Segs]
+        [{_,Segs}|_] -> [Seg || {_,Seg}<-Segs]
     end.
 
 get_buckets(Segments,#config{bucket_low=BucketLow, bucket_high=BucketHigh, min_segment_size=MinSegSize})->
     %% sort segs to group them in average size groups in a deterministic way
     SortedSizedSegments = lists:sort([{mi_segment:filesize(X),X} || X <- Segments]),
     lists:foldl(fun({Size,_}=Seg,Acc0)->
-        NotSimilar = fun({AverageSize,Bucket})->
-            not ((Size > AverageSize*BucketLow and Size < AverageSize*BucketHigh) or (Size < MinSegSize and AverageSize < MinSegSize))
+        NotSimilar = fun({AverageSize,_})->
+            not ((Size > AverageSize*BucketLow andalso Size < AverageSize*BucketHigh) 
+                orelse (Size < MinSegSize andalso AverageSize < MinSegSize))
         end,
         case lists:dropwhile(NotSimilar,dict:to_list(Acc0)) of % if a bucket is similar, add seg to bucket and change averagesize
             [{AverageSize,Bucket}|_] -> NbSeg = length(Bucket),
