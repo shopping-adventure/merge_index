@@ -130,7 +130,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% ====================================================================
 %% Internal worker
 %% ====================================================================
--define(TIMERING_SIZE, 40).
+-define(TIMERING_SIZE, 15).
 -define(TIMERING_SPAN_INIT, 3).
 
 -record(wstate, { parent,
@@ -181,19 +181,14 @@ worker_loop(#wstate{parent=Parent,timering=TimeRing,
             spawn_link(fun()->
                 Start = os:timestamp(),
                 Result = merge_index:compact(Pid),
-                Worker ! {compaction_res,Result},
-                ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
                 case Result of
+                    {ok, 0, 0}->ok;
                     {ok, OldSegments, OldBytes} ->
-                        case ElapsedSecs > 1 of
-                            true ->
-                                lager:info(
-                                  "Single Compaction ~p: ~p segments for ~p bytes in ~p seconds, ~.2f MB/sec",
-                                  [Pid, OldSegments, OldBytes, ElapsedSecs, OldBytes/ElapsedSecs/(1024*1024)]);
-                            false ->
-                                ok
-                        end;
-
+                        Worker ! {compaction_res,Result},
+                        ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
+                        lager:debug(
+                          "Single Compaction ~p: ~p segments for ~p bytes in ~p seconds, ~.2f MB/sec",
+                          [Pid, OldSegments, OldBytes, ElapsedSecs, OldBytes/ElapsedSecs/(1024*1024)]);
                     {Error, Reason} when Error == error; Error == 'EXIT' ->
                         lager:error("Failed to compact ~p: ~p", [Pid, Reason])
                 end
