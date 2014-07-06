@@ -66,14 +66,12 @@ init([]) ->
     %% Trap exits of the actual worker process
     process_flag(trap_exit, true),
 
-    {ok,WantedThroughput} = application:get_env(merge_index, compaction_throughput_mb_per_sec),
-
     %% Use a dedicated worker sub-process to do the actual merging. The
     %% process may ignore messages for a long while during the compaction
     %% and we want to ensure that our message queue doesn't fill up with
     %% a bunch of dup requests for the same directory.
     Self = self(),
-    WorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(Self,WantedThroughput)) end),
+    WorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(Self)) end),
     {ok, #state{ queue = queue:new(),
                  worker = WorkerPid,
                  ready = true}}.
@@ -111,9 +109,8 @@ handle_info({worker_ready, WorkerPid}, #state { queue = Q } = State) ->
 handle_info({'EXIT', WorkerPid, Reason}, #state { worker = WorkerPid } = State) ->
     lager:error("Compaction worker ~p exited: ~p", [WorkerPid, Reason]),
     %% Start a new worker.
-    {ok,WantedThroughput} = application:get_env(merge_index, compaction_throughput_mb_per_sec),
     Self = self(),
-    NewWorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(Self,WantedThroughput)) end),
+    NewWorkerPid = spawn_link(fun() -> worker_loop(worker_init_state(Self)) end),
     NewState = State#state { worker=NewWorkerPid , ready = true},
     {noreply, NewState};
 
@@ -134,7 +131,6 @@ code_change(_OldVsn, State, _Extra) ->
 -define(TIMERING_SPAN_INIT, 3).
 
 -record(wstate, { parent,
-                 wanted_throughput,
                  timering,
                  timering_span,
                  test_start,
@@ -149,12 +145,13 @@ replace_oldest({Set,Idx})->
 ms_before_replace({Set,Idx},N)->
    max(0,timer:seconds(N) - trunc(timer:now_diff(now(),element(Idx,Set))/1000)).
 
-worker_init_state(Parent,WantedThroughput)->
-    #wstate{parent=Parent, timering=new_timering(?TIMERING_SIZE),wanted_throughput=WantedThroughput,
+worker_init_state(Parent)->
+    #wstate{parent=Parent, timering=new_timering(?TIMERING_SIZE),
         timering_span=?TIMERING_SPAN_INIT,test_start=now(),test_compactions=[]}.
 
-worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,wanted_throughput=WantedThroughput,
+worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
                    test_compactions=TestCompactions}=State) when length(TestCompactions)==?TIMERING_SIZE ->
+    {ok,WantedThroughput} = application:get_env(merge_index, compaction_throughput_mb_per_sec),
     TestBytes = lists:sum([OldBytes || {ok, _, OldBytes}<-TestCompactions]),
     TestSegments = lists:sum([OldSegments || {ok, OldSegments, _}<-TestCompactions]),
     TestElapsedSecs = timer:now_diff(os:timestamp(), TestStart) / 1000000,
