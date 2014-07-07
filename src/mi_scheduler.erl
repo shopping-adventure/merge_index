@@ -127,8 +127,8 @@ code_change(_OldVsn, State, _Extra) ->
 %% ====================================================================
 %% Internal worker
 %% ====================================================================
--define(TIMERING_SIZE, 15).
--define(TIMERING_SPAN_INIT, 3).
+-define(TIMERING_SIZE, 10).
+-define(TIMERING_AJUST_EVERY, 5).
 
 -record(wstate, { parent,
                  timering,
@@ -136,35 +136,36 @@ code_change(_OldVsn, State, _Extra) ->
                  test_start,
                  test_compactions}).
 
-%% THROTTLING: Run M processes in N seconds waiting ms_before_replace(Ring,N) before doing something
+%% THROTTLING: Run M processes in N milliseconds waiting ms_before_replace(Ring,N) before doing something
 %% and replace_oldest (impl is a set of size M of timestamps representing running processes.
 %% Replace the oldest one if older than N seconds else wait (oldest_ts-Nsec) : {Ts_Set, Oldest_Idx}
 new_timering(M)->{erlang:make_tuple(M,now()),1}.
 replace_oldest({Set,Idx})->
    {erlang:setelement(Idx,Set,now()),case Idx+1 of X when X>erlang:size(Set) ->1; X->X end}.
 ms_before_replace({Set,Idx},N)->
-   max(0,timer:seconds(N) - trunc(timer:now_diff(now(),element(Idx,Set))/1000)).
+   max(0,N - trunc(timer:now_diff(now(),element(Idx,Set))/1000)).
 
 worker_init_state(Parent)->
     #wstate{parent=Parent, timering=new_timering(?TIMERING_SIZE),
-        timering_span=?TIMERING_SPAN_INIT,test_start=now(),test_compactions=[]}.
+        timering_span=0,test_start=now(),test_compactions=[]}.
 
 worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
-                   test_compactions=TestCompactions}=State) when length(TestCompactions)==?TIMERING_SIZE ->
+        test_compactions=TestCompactions}=State) when length(TestCompactions)==(?TIMERING_SIZE*?TIMERING_AJUST_EVERY) ->
     {ok,WantedThroughput} = application:get_env(merge_index, compaction_throughput_mb_per_sec),
     TestBytes = lists:sum([OldBytes || {ok, _, OldBytes}<-TestCompactions]),
     TestSegments = lists:sum([OldSegments || {ok, OldSegments, _}<-TestCompactions]),
-    TestElapsedSecs = timer:now_diff(os:timestamp(), TestStart) / 1000000,
-    Throughput = TestBytes/TestElapsedSecs/(1024*1024),
-    lager:info("Overall Compaction: ~p segments for ~p bytes in ~p seconds, ~.2f MB/sec",
-               [TestSegments, TestBytes, TestElapsedSecs, Throughput]),
-    AcceptableDiff = WantedThroughput*0.2,
-    case abs(Throughput-WantedThroughput) of
+    TestElapsedMSecs = timer:now_diff(os:timestamp(), TestStart) / 1000,
+    ThroughputBms = TestBytes/TestElapsedMSecs,
+    WantedThroughputBms = WantedThroughput *1024*1024 / 1000,
+    lager:info("Overall Compaction: ~p segments for ~p MBytes in ~p milliseconds, ~.2f MB/sec",
+               [TestSegments, TestBytes/(1024*1024), TestElapsedMSecs, (ThroughputBms*1000) / (1024*1024)]),
+    AcceptableDiff = WantedThroughputBms*0.2,
+    case abs(ThroughputBms-WantedThroughputBms) of
         Diff when Diff < AcceptableDiff -> 
             worker_loop(State#wstate{timering_span=TimeRingSpan,test_start=now(),test_compactions=[]});
         _ -> %% We need to adjust timering span window in order to have the good throughput
-            NewTimeRingSpan = trunc(TimeRingSpan * (Throughput/WantedThroughput)) + 1,
-            lager:info("Adjust throttling to have ~p compaction every ~p seconds",[?TIMERING_SIZE,NewTimeRingSpan]),
+            NewTimeRingSpan = trunc(TestBytes/WantedThroughputBms/?TIMERING_AJUST_EVERY)+1,
+            lager:info("Adjust throttling to have ~p compaction every ~p milliseconds",[?TIMERING_SIZE,NewTimeRingSpan]),
             worker_loop(State#wstate{timering_span=NewTimeRingSpan,test_start=now(),test_compactions=[]})
     end;
 
@@ -182,10 +183,10 @@ worker_loop(#wstate{parent=Parent,timering=TimeRing,
                     {ok, 0, 0}->ok;
                     {ok, OldSegments, OldBytes} ->
                         Worker ! {compaction_res,Result},
-                        ElapsedSecs = timer:now_diff(os:timestamp(), Start) / 1000000,
+                        ElapsedMSecs = timer:now_diff(os:timestamp(), Start) / 1000,
                         lager:debug(
-                          "Single Compaction ~p: ~p segments for ~p bytes in ~p seconds, ~.2f MB/sec",
-                          [Pid, OldSegments, OldBytes, ElapsedSecs, OldBytes/ElapsedSecs/(1024*1024)]);
+                          "Single Compaction ~p: ~p segments for ~p bytes in ~p milliseconds, ~.2f MB/sec",
+                          [Pid, OldSegments, OldBytes, ElapsedMSecs, OldBytes/ElapsedMSecs/1024]);
                     {Error, Reason} when Error == error; Error == 'EXIT' ->
                         lager:error("Failed to compact ~p: ~p", [Pid, Reason])
                 end
