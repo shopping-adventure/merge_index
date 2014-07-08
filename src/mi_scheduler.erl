@@ -147,7 +147,7 @@ ms_before_replace({Set,Idx},N)->
 
 worker_init_state(Parent)->
     #wstate{parent=Parent, timering=new_timering(?TIMERING_SIZE),
-        timering_span=0,test_start=now(),test_compactions=[]}.
+        timering_span=1000,test_start=now(),test_compactions=[]}.
 
 worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
         test_compactions=TestCompactions}=State) when length(TestCompactions)==(?TIMERING_SIZE*?TIMERING_AJUST_EVERY) ->
@@ -157,17 +157,16 @@ worker_loop(#wstate{timering_span=TimeRingSpan,test_start=TestStart,
     TestElapsedMSecs = timer:now_diff(os:timestamp(), TestStart) / 1000,
     ThroughputBms = TestBytes/TestElapsedMSecs,
     WantedThroughputBms = WantedThroughput *1024*1024 / 1000,
-    lager:info("Overall Compaction: ~p segments for ~p MBytes in ~p milliseconds, ~.2f MB/sec",
-               [TestSegments, TestBytes/(1024*1024), TestElapsedMSecs, (ThroughputBms*1000) / (1024*1024)]),
-    AcceptableDiff = WantedThroughputBms*0.2,
-    case abs(ThroughputBms-WantedThroughputBms) of
-        Diff when Diff < AcceptableDiff -> 
-            worker_loop(State#wstate{timering_span=TimeRingSpan,test_start=now(),test_compactions=[]});
-        _ -> %% We need to adjust timering span window in order to have the good throughput
-            NewTimeRingSpan = trunc(TestBytes/WantedThroughputBms/?TIMERING_AJUST_EVERY)+1,
-            lager:info("Adjust throttling to have ~p compaction every ~p milliseconds",[?TIMERING_SIZE,NewTimeRingSpan]),
-            worker_loop(State#wstate{timering_span=NewTimeRingSpan,test_start=now(),test_compactions=[]})
-    end;
+    lager:info("Overall Compaction: ~p segments for ~p MBytes in ~.2f seconds, ~.2f MB/sec",
+               [TestSegments, TestBytes/(1024*1024), TestElapsedMSecs/1000, (ThroughputBms*1000) / (1024*1024)]),
+    %% We need to adjust timering span window in order to have the good throughput
+    %% ensure a kind of continuity not allowing more than 30% adjustment
+    Span = case trunc(TestBytes/WantedThroughputBms/?TIMERING_AJUST_EVERY)+1 of 
+        NewTime when NewTime < TimeRingSpan -> max(trunc(TimeRingSpan*0.3)+1,NewTime);
+        NewTime -> min(trunc(TimeRingSpan*1.3)+1,NewTime)
+    end,
+    lager:info("Adjust throttling to have ~p compaction every ~p milliseconds",[?TIMERING_SIZE,Span]),
+    worker_loop(State#wstate{timering_span=Span,test_start=now(),test_compactions=[]});
 
 worker_loop(#wstate{parent=Parent,timering=TimeRing,
                     timering_span=TimeRingSpan, test_compactions=TestCompactions}=State) ->
